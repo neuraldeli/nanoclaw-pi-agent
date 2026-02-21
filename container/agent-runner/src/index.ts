@@ -993,6 +993,18 @@ async function runOpenAIQuery(
     previousResponseId: string | undefined,
     allowResumeFallback: boolean,
   ): Promise<OpenAIResponseLike> => {
+    const createResponseRaw = async (body: Record<string, unknown>): Promise<OpenAIResponseLike> => {
+      return await client.responses.create(body as any) as OpenAIResponseLike;
+    };
+    const createResponseStreamRaw = async (
+      body: Record<string, unknown>,
+    ): Promise<AsyncIterable<OpenAIResponseStreamEventLike>> => {
+      return await client.responses.create({
+        ...body,
+        stream: true,
+      } as any) as unknown as AsyncIterable<OpenAIResponseStreamEventLike>;
+    };
+
     const requestInput = (!hasApiKey && typeof input === 'string')
       ? [{
         type: 'message',
@@ -1013,13 +1025,10 @@ async function runOpenAIQuery(
     };
     const createOnce = async (): Promise<OpenAIResponseLike> => {
       if (!useStreaming) {
-        return await client.responses.create(requestBodyBase) as OpenAIResponseLike;
+        return await createResponseRaw(requestBodyBase);
       }
 
-      const stream = await client.responses.create({
-        ...requestBodyBase,
-        stream: true,
-      }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+      const stream = await createResponseStreamRaw(requestBodyBase);
       let completedResponse: OpenAIResponseLike | undefined;
       for await (const event of stream) {
         if (!event || typeof event.type !== 'string') continue;
@@ -1067,12 +1076,9 @@ async function runOpenAIQuery(
           include: [] as string[],
         };
         if (!useStreaming) {
-          return await client.responses.create(fallbackBody) as OpenAIResponseLike;
+          return await createResponseRaw(fallbackBody);
         }
-        const fallbackStream = await client.responses.create({
-          ...fallbackBody,
-          stream: true,
-        }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+        const fallbackStream = await createResponseStreamRaw(fallbackBody);
         let fallbackCompletedResponse: OpenAIResponseLike | undefined;
         for await (const event of fallbackStream) {
           if (!event || typeof event.type !== 'string') continue;
@@ -1107,12 +1113,9 @@ async function runOpenAIQuery(
         include: [] as string[],
       };
       if (!useStreaming) {
-        return await client.responses.create(resumedBody) as OpenAIResponseLike;
+        return await createResponseRaw(resumedBody);
       }
-      const resumedStream = await client.responses.create({
-        ...resumedBody,
-        stream: true,
-      }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+      const resumedStream = await createResponseStreamRaw(resumedBody);
       let resumedCompletedResponse: OpenAIResponseLike | undefined;
       for await (const event of resumedStream) {
         if (!event || typeof event.type !== 'string') continue;
