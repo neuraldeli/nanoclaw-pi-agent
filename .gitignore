@@ -9,14 +9,14 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - only track base structure and specific CODEX.md files
 groups/*
 !groups/main/
 !groups/global/
 groups/main/*
 groups/global/*
-!groups/main/CLAUDE.md
-!groups/global/CLAUDE.md
+!groups/main/CODEX.md
+!groups/global/CODEX.md
 
 # Secrets
 *.keys.json
@@ -29,7 +29,7 @@ groups/global/*
 .idea/
 .vscode/
 
-# Skills system (local per-installation state)
+# Local per-installation state
 .nanoclaw/
 
 agents-sdk-docs

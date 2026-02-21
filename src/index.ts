@@ -9,10 +9,8 @@ import {
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TELEGRAM_BOT_TOKEN,
-  TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
 import { TelegramChannel } from './channels/telegram.js';
 import {
   ContainerOutput,
@@ -51,7 +49,6 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -482,29 +479,15 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  if (TELEGRAM_ONLY && !TELEGRAM_BOT_TOKEN) {
+  if (!TELEGRAM_BOT_TOKEN) {
     throw new Error(
-      'TELEGRAM_ONLY is enabled but TELEGRAM_BOT_TOKEN is not set. Create a bot via @BotFather and set TELEGRAM_BOT_TOKEN in .env.',
+      'TELEGRAM_BOT_TOKEN is not set. Create a bot via @BotFather and set TELEGRAM_BOT_TOKEN in .env.',
     );
   }
 
-  if (!TELEGRAM_ONLY) {
-    whatsapp = new WhatsAppChannel(channelOpts);
-    channels.push(whatsapp);
-    await whatsapp.connect();
-  }
-
-  if (TELEGRAM_BOT_TOKEN) {
-    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
-    channels.push(telegram);
-    await telegram.connect();
-  }
-
-  if (channels.length === 0) {
-    throw new Error(
-      'No channels configured. Set TELEGRAM_BOT_TOKEN (Telegram) or disable TELEGRAM_ONLY to use WhatsApp.',
-    );
-  }
+  const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+  channels.push(telegram);
+  await telegram.connect();
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -527,7 +510,7 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
+    syncGroupMetadata: (_force) => Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });

@@ -1,14 +1,14 @@
 ## Type of Change
 
-- [ ] **Skill** - adds a new skill in `.claude/skills/`
-- [ ] **Fix** - bug fix or security fix to source code
-- [ ] **Simplification** - reduces or simplifies source code
+- [ ] Fix
+- [ ] Feature
+- [ ] Refactor / Simplification
+- [ ] Docs
 
 ## Description
 
 
-## For Skills
+## Validation
 
-- [ ] I have not made any changes to source code
-- [ ] My skill contains instructions for Claude to follow (not pre-built code)
-- [ ] I tested this skill on a fresh clone
+- [ ] `npm run build`
+- [ ] `npm test` (or documented why not)
