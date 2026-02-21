@@ -129,6 +129,16 @@ interface OpenAILocalShellCallOutputInput {
 
 type OpenAIToolOutputInput = OpenAIFunctionCallOutputInput | OpenAILocalShellCallOutputInput;
 
+interface OpenAIResponseStreamEventLike {
+  type?: string;
+  message?: string;
+  response?: OpenAIResponseLike & {
+    error?: {
+      message?: string;
+    } | null;
+  };
+}
+
 interface OpenAIOAuthTokenResponse {
   access_token?: string;
   refresh_token?: string;
@@ -316,6 +326,10 @@ const OPENAI_TOOLS: OpenAITool[] = [
   { type: 'local_shell' },
   { type: 'web_search_preview' },
   ...OPENAI_FUNCTION_TOOLS,
+];
+
+const OPENAI_OAUTH_TOOLS: OpenAITool[] = [
+  { type: 'local_shell' },
 ];
 
 async function readStdin(): Promise<string> {
@@ -939,7 +953,8 @@ async function runOpenAIQuery(
     : hasApiKey;
   const tools: OpenAITool[] = hasApiKey
     ? OPENAI_TOOLS
-    : OPENAI_FUNCTION_TOOLS;
+    : OPENAI_OAUTH_TOOLS;
+  const useStreaming = !hasApiKey;
   const chatgptAccountId = hasApiKey
     ? undefined
     : extractChatgptAccountIdFromJwt(apiKey);
@@ -966,16 +981,47 @@ async function runOpenAIQuery(
     previousResponseId: string | undefined,
     allowResumeFallback: boolean,
   ): Promise<OpenAIResponseLike> => {
+    const requestBodyBase = {
+      model: activeModel,
+      input,
+      previous_response_id: previousResponseId,
+      instructions,
+      tools,
+      tool_choice: 'auto' as const,
+      parallel_tool_calls: allowParallelToolCalls,
+    };
+    const createOnce = async (): Promise<OpenAIResponseLike> => {
+      if (!useStreaming) {
+        return await client.responses.create(requestBodyBase) as OpenAIResponseLike;
+      }
+
+      const stream = await client.responses.create({
+        ...requestBodyBase,
+        stream: true,
+      }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+      let completedResponse: OpenAIResponseLike | undefined;
+      for await (const event of stream) {
+        if (!event || typeof event.type !== 'string') continue;
+        if (event.type === 'response.completed' && event.response) {
+          completedResponse = event.response;
+          continue;
+        }
+        if (event.type === 'response.failed') {
+          const message = event.response?.error?.message || 'OpenAI streaming response failed';
+          throw new Error(message);
+        }
+        if (event.type === 'error') {
+          throw new Error(event.message || 'OpenAI streaming error');
+        }
+      }
+      if (!completedResponse) {
+        throw new Error('OpenAI streaming response ended without response.completed');
+      }
+      return completedResponse;
+    };
+
     try {
-      return await client.responses.create({
-        model: activeModel,
-        input,
-        previous_response_id: previousResponseId,
-        instructions,
-        tools,
-        tool_choice: 'auto',
-        parallel_tool_calls: allowParallelToolCalls,
-      }) as OpenAIResponseLike;
+      return await createOnce();
     } catch (err) {
       const status = errorStatusCode(err);
       if (
@@ -989,26 +1035,78 @@ async function runOpenAIQuery(
           `OpenAI request failed with model ${activeModel} (status 400). Retrying once with fallback model ${DEFAULT_OPENAI_MODEL}.`,
         );
         activeModel = DEFAULT_OPENAI_MODEL;
-        return await client.responses.create({
+        const fallbackBody = {
           model: activeModel,
           input,
           instructions,
           tools,
-          tool_choice: 'auto',
+          tool_choice: 'auto' as const,
           parallel_tool_calls: false,
-        }) as OpenAIResponseLike;
+        };
+        if (!useStreaming) {
+          return await client.responses.create(fallbackBody) as OpenAIResponseLike;
+        }
+        const fallbackStream = await client.responses.create({
+          ...fallbackBody,
+          stream: true,
+        }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+        let fallbackCompletedResponse: OpenAIResponseLike | undefined;
+        for await (const event of fallbackStream) {
+          if (!event || typeof event.type !== 'string') continue;
+          if (event.type === 'response.completed' && event.response) {
+            fallbackCompletedResponse = event.response;
+            continue;
+          }
+          if (event.type === 'response.failed') {
+            const message = event.response?.error?.message || 'OpenAI fallback streaming response failed';
+            throw new Error(message);
+          }
+          if (event.type === 'error') {
+            throw new Error(event.message || 'OpenAI fallback streaming error');
+          }
+        }
+        if (!fallbackCompletedResponse) {
+          throw new Error('OpenAI fallback streaming response ended without response.completed');
+        }
+        return fallbackCompletedResponse;
       }
       if (!allowResumeFallback || !previousResponseId) throw err;
       const msg = formatAgentError(err);
       log(`OpenAI resume failed for session ${previousResponseId}: ${msg}. Retrying without previous_response_id.`);
-      return await client.responses.create({
+      const resumedBody = {
         model: activeModel,
         input,
         instructions,
         tools,
-        tool_choice: 'auto',
+        tool_choice: 'auto' as const,
         parallel_tool_calls: allowParallelToolCalls,
-      }) as OpenAIResponseLike;
+      };
+      if (!useStreaming) {
+        return await client.responses.create(resumedBody) as OpenAIResponseLike;
+      }
+      const resumedStream = await client.responses.create({
+        ...resumedBody,
+        stream: true,
+      }) as AsyncIterable<OpenAIResponseStreamEventLike>;
+      let resumedCompletedResponse: OpenAIResponseLike | undefined;
+      for await (const event of resumedStream) {
+        if (!event || typeof event.type !== 'string') continue;
+        if (event.type === 'response.completed' && event.response) {
+          resumedCompletedResponse = event.response;
+          continue;
+        }
+        if (event.type === 'response.failed') {
+          const message = event.response?.error?.message || 'OpenAI resumed streaming response failed';
+          throw new Error(message);
+        }
+        if (event.type === 'error') {
+          throw new Error(event.message || 'OpenAI resumed streaming error');
+        }
+      }
+      if (!resumedCompletedResponse) {
+        throw new Error('OpenAI resumed streaming response ended without response.completed');
+      }
+      return resumedCompletedResponse;
     }
   };
 
