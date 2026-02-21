@@ -133,6 +133,33 @@ interface OpenAIOAuthTokenResponse {
   expires_in?: number;
 }
 
+function decodeBase64Url(input: string): string {
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = normalized.length % 4;
+  const padded = pad ? normalized + '='.repeat(4 - pad) : normalized;
+  return Buffer.from(padded, 'base64').toString('utf-8');
+}
+
+function extractChatgptAccountIdFromJwt(token: string): string | undefined {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return undefined;
+    const payloadRaw = decodeBase64Url(parts[1]);
+    const payload = JSON.parse(payloadRaw) as {
+      [key: string]: unknown;
+      'https://api.openai.com/auth'?: {
+        chatgpt_account_id?: string;
+      };
+    };
+    const auth = payload['https://api.openai.com/auth'];
+    if (!auth || typeof auth !== 'object') return undefined;
+    const accountId = (auth as { chatgpt_account_id?: unknown }).chatgpt_account_id;
+    return typeof accountId === 'string' && accountId ? accountId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
   {
     type: 'function',
@@ -867,10 +894,20 @@ async function runOpenAIQuery(
   const baseURL =
     sdkEnv.OPENAI_BASE_URL ||
     (hasApiKey ? undefined : CHATGPT_CODEX_BASE_URL);
+  const chatgptAccountId = hasApiKey
+    ? undefined
+    : extractChatgptAccountIdFromJwt(apiKey);
+  const defaultHeaders: Record<string, string> = {};
+  if (chatgptAccountId) {
+    defaultHeaders['ChatGPT-Account-ID'] = chatgptAccountId;
+  }
 
   const client = new OpenAI({
     apiKey,
     baseURL,
+    defaultHeaders: Object.keys(defaultHeaders).length > 0
+      ? defaultHeaders
+      : undefined,
   });
 
   const model = sdkEnv.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
