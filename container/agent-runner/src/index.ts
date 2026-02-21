@@ -9,6 +9,7 @@ import { spawn } from 'child_process';
 import OpenAI from 'openai';
 import { fileURLToPath } from 'url';
 import { CronExpressionParser } from 'cron-parser';
+import { createHash } from 'crypto';
 
 interface ContainerInput {
   prompt: string;
@@ -43,11 +44,11 @@ const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const DEFAULT_OPENAI_MODEL = 'gpt-5-codex';
 const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
-const CHATGPT_ORIGINATOR = 'pi';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const OPENAI_PARALLEL_TOOL_CALLS_ENV = 'OPENAI_PARALLEL_TOOL_CALLS';
+const OPENAI_OAUTH_ORIGINATOR_ENV = 'OPENAI_OAUTH_ORIGINATOR';
 
 interface OpenAIFunctionTool {
   type: 'function';
@@ -150,6 +151,11 @@ function decodeBase64Url(input: string): string {
   const pad = normalized.length % 4;
   const padded = pad ? normalized + '='.repeat(4 - pad) : normalized;
   return Buffer.from(padded, 'base64').toString('utf-8');
+}
+
+function toUuidLikeFromSeed(seed: string): string {
+  const hex = createHash('sha256').update(seed).digest('hex').slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
 function extractChatgptAccountIdFromJwt(token: string): string | undefined {
@@ -961,7 +967,13 @@ async function runOpenAIQuery(
   const defaultHeaders: Record<string, string> = {};
   if (chatgptAccountId) {
     defaultHeaders['ChatGPT-Account-ID'] = chatgptAccountId;
-    defaultHeaders.originator = CHATGPT_ORIGINATOR;
+  }
+  if (!hasApiKey) {
+    defaultHeaders.session_id = toUuidLikeFromSeed(`nanoclaw:${containerInput.chatJid}`);
+    const configuredOriginator = sdkEnv[OPENAI_OAUTH_ORIGINATOR_ENV]?.trim();
+    if (configuredOriginator) {
+      defaultHeaders.originator = configuredOriginator;
+    }
   }
 
   const client = new OpenAI({
@@ -981,14 +993,23 @@ async function runOpenAIQuery(
     previousResponseId: string | undefined,
     allowResumeFallback: boolean,
   ): Promise<OpenAIResponseLike> => {
+    const requestInput = (!hasApiKey && typeof input === 'string')
+      ? [{
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: input }],
+      }]
+      : input;
     const requestBodyBase = {
       model: activeModel,
-      input,
+      input: requestInput,
       previous_response_id: previousResponseId,
       instructions,
       tools,
       tool_choice: 'auto' as const,
       parallel_tool_calls: allowParallelToolCalls,
+      store: false,
+      include: [] as string[],
     };
     const createOnce = async (): Promise<OpenAIResponseLike> => {
       if (!useStreaming) {
@@ -1037,11 +1058,13 @@ async function runOpenAIQuery(
         activeModel = DEFAULT_OPENAI_MODEL;
         const fallbackBody = {
           model: activeModel,
-          input,
+          input: requestInput,
           instructions,
           tools,
           tool_choice: 'auto' as const,
           parallel_tool_calls: false,
+          store: false,
+          include: [] as string[],
         };
         if (!useStreaming) {
           return await client.responses.create(fallbackBody) as OpenAIResponseLike;
@@ -1075,11 +1098,13 @@ async function runOpenAIQuery(
       log(`OpenAI resume failed for session ${previousResponseId}: ${msg}. Retrying without previous_response_id.`);
       const resumedBody = {
         model: activeModel,
-        input,
+        input: requestInput,
         instructions,
         tools,
         tool_choice: 'auto' as const,
         parallel_tool_calls: allowParallelToolCalls,
+        store: false,
+        include: [] as string[],
       };
       if (!useStreaming) {
         return await client.responses.create(resumedBody) as OpenAIResponseLike;
