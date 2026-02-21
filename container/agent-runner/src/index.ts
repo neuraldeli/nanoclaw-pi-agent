@@ -43,9 +43,11 @@ const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const DEFAULT_OPENAI_MODEL = 'gpt-5-codex';
 const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
+const CHATGPT_ORIGINATOR = 'pi';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const OPENAI_PARALLEL_TOOL_CALLS_ENV = 'OPENAI_PARALLEL_TOOL_CALLS';
 
 interface OpenAIFunctionTool {
   type: 'function';
@@ -160,12 +162,50 @@ function extractChatgptAccountIdFromJwt(token: string): string | undefined {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function errorStatusCode(err: unknown): number | undefined {
+  if (!isRecord(err)) return undefined;
+  const status = err.status;
+  return typeof status === 'number' ? status : undefined;
+}
+
+function truncate(value: string, max = 280): string {
+  if (value.length <= max) return value;
+  return `${value.slice(0, max)}...`;
+}
+
+function formatAgentError(err: unknown): string {
+  if (err instanceof Error) {
+    const record = err as Error & {
+      status?: number;
+      request_id?: string;
+      error?: unknown;
+      headers?: Record<string, unknown>;
+    };
+    const details: string[] = [err.message];
+    if (typeof record.status === 'number') {
+      details.push(`status=${record.status}`);
+    }
+    if (typeof record.request_id === 'string' && record.request_id) {
+      details.push(`request_id=${record.request_id}`);
+    }
+    if (isRecord(record.error) && typeof record.error.message === 'string') {
+      details.push(`api_error=${truncate(record.error.message)}`);
+    }
+    return details.join(' | ');
+  }
+  return String(err);
+}
+
 const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
   {
     type: 'function',
     name: 'send_message',
     description: "Send a message to the user or group immediately while you're still running.",
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -181,7 +221,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     name: 'schedule_task',
     description:
       'Schedule a recurring or one-time task. context_mode can be "group" (with chat context) or "isolated" (fresh context).',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -203,7 +243,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     type: 'function',
     name: 'list_tasks',
     description: 'List scheduled tasks. Main group sees all; other groups only see their own tasks.',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -215,7 +255,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     type: 'function',
     name: 'pause_task',
     description: 'Pause a scheduled task.',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -229,7 +269,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     type: 'function',
     name: 'resume_task',
     description: 'Resume a paused task.',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -243,7 +283,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     type: 'function',
     name: 'cancel_task',
     description: 'Cancel and delete a scheduled task.',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -257,7 +297,7 @@ const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
     type: 'function',
     name: 'register_group',
     description: 'Register a new chat so the agent can respond there. Main group only.',
-    strict: true,
+    strict: false,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -894,12 +934,19 @@ async function runOpenAIQuery(
   const baseURL =
     sdkEnv.OPENAI_BASE_URL ||
     (hasApiKey ? undefined : CHATGPT_CODEX_BASE_URL);
+  const allowParallelToolCalls = sdkEnv[OPENAI_PARALLEL_TOOL_CALLS_ENV]?.toLowerCase() === 'true'
+    ? true
+    : hasApiKey;
+  const tools: OpenAITool[] = hasApiKey
+    ? OPENAI_TOOLS
+    : OPENAI_FUNCTION_TOOLS;
   const chatgptAccountId = hasApiKey
     ? undefined
     : extractChatgptAccountIdFromJwt(apiKey);
   const defaultHeaders: Record<string, string> = {};
   if (chatgptAccountId) {
     defaultHeaders['ChatGPT-Account-ID'] = chatgptAccountId;
+    defaultHeaders.originator = CHATGPT_ORIGINATOR;
   }
 
   const client = new OpenAI({
@@ -911,6 +958,7 @@ async function runOpenAIQuery(
   });
 
   const model = sdkEnv.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+  let activeModel = model;
   const instructions = buildOpenAIInstructions(containerInput);
 
   const createResponse = async (
@@ -920,30 +968,51 @@ async function runOpenAIQuery(
   ): Promise<OpenAIResponseLike> => {
     try {
       return await client.responses.create({
-        model,
+        model: activeModel,
         input,
         previous_response_id: previousResponseId,
         instructions,
-        tools: OPENAI_TOOLS,
+        tools,
         tool_choice: 'auto',
-        parallel_tool_calls: true,
+        parallel_tool_calls: allowParallelToolCalls,
       }) as OpenAIResponseLike;
     } catch (err) {
+      const status = errorStatusCode(err);
+      if (
+        !hasApiKey &&
+        status === 400 &&
+        activeModel !== DEFAULT_OPENAI_MODEL &&
+        typeof input === 'string' &&
+        !previousResponseId
+      ) {
+        log(
+          `OpenAI request failed with model ${activeModel} (status 400). Retrying once with fallback model ${DEFAULT_OPENAI_MODEL}.`,
+        );
+        activeModel = DEFAULT_OPENAI_MODEL;
+        return await client.responses.create({
+          model: activeModel,
+          input,
+          instructions,
+          tools,
+          tool_choice: 'auto',
+          parallel_tool_calls: false,
+        }) as OpenAIResponseLike;
+      }
       if (!allowResumeFallback || !previousResponseId) throw err;
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = formatAgentError(err);
       log(`OpenAI resume failed for session ${previousResponseId}: ${msg}. Retrying without previous_response_id.`);
       return await client.responses.create({
-        model,
+        model: activeModel,
         input,
         instructions,
-        tools: OPENAI_TOOLS,
+        tools,
         tool_choice: 'auto',
-        parallel_tool_calls: true,
+        parallel_tool_calls: allowParallelToolCalls,
       }) as OpenAIResponseLike;
     }
   };
 
-  log(`Running OpenAI query with model ${model} (session: ${sessionId || 'new'})`);
+  log(`Running OpenAI query with model ${activeModel} (session: ${sessionId || 'new'})`);
   let previousResponseId = sessionId;
   let input: string | OpenAIToolOutputInput[] = prompt;
   let response = await createResponse(input, previousResponseId, true);
@@ -1012,7 +1081,7 @@ async function runOpenAIQuery(
     result: text || null,
     newSessionId: response.id,
     usage: usageTotals,
-    model,
+    model: activeModel,
   });
 
   return {
@@ -1091,7 +1160,7 @@ async function main(): Promise<void> {
       prompt = nextMessage;
     }
   } catch (err) {
-    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errorMessage = formatAgentError(err);
     log(`Agent error: ${errorMessage}`);
     writeOutput({
       status: 'error',
