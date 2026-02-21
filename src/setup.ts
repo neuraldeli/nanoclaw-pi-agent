@@ -11,7 +11,8 @@ const DEFAULT_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const OPENAI_OAUTH_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize';
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const OPENAI_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback';
-const OPENAI_OAUTH_SCOPE = 'openid profile email offline_access';
+const OPENAI_OAUTH_SCOPE =
+  'openid profile email offline_access api.responses.read api.responses.write';
 
 interface OAuthTokenResponse {
   access_token?: string;
