@@ -15,6 +15,7 @@ import {
   getAllTasks,
   getDueTasks,
   getTaskById,
+  logTokenUsage,
   logTaskRun,
   updateTaskAfterRun,
 } from './db.js';
@@ -114,6 +115,17 @@ async function runTask(
       },
       (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        if (streamedOutput.usage && streamedOutput.usage.totalTokens > 0) {
+          logTokenUsage({
+            chat_jid: task.chat_jid,
+            group_folder: task.group_folder,
+            model: streamedOutput.model,
+            prompt_tokens: streamedOutput.usage.promptTokens,
+            completion_tokens: streamedOutput.usage.completionTokens,
+            total_tokens: streamedOutput.usage.totalTokens,
+          });
+        }
+
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)

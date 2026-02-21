@@ -25,6 +25,14 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  usage?: OpenAITokenUsage;
+  model?: string;
+}
+
+interface OpenAITokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
 }
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -71,8 +79,16 @@ interface OpenAIResponseOutputItem {
 
 interface OpenAIResponseLike {
   id: string;
+  model?: string;
   output_text?: string;
   output?: OpenAIResponseOutputItem[];
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens?: number;
+    completion_tokens?: number;
+  };
 }
 
 interface OpenAIFunctionCallItem {
@@ -395,6 +411,30 @@ function extractOpenAIToolCalls(response: unknown): OpenAIToolCallItem[] {
   }
 
   return calls;
+}
+
+function extractOpenAIUsage(response: OpenAIResponseLike): OpenAITokenUsage {
+  const usage = response.usage || {};
+  const promptTokens = usage.input_tokens ?? usage.prompt_tokens ?? 0;
+  const completionTokens = usage.output_tokens ?? usage.completion_tokens ?? 0;
+  const totalTokens = usage.total_tokens ?? promptTokens + completionTokens;
+
+  return {
+    promptTokens: Number.isFinite(promptTokens) ? promptTokens : 0,
+    completionTokens: Number.isFinite(completionTokens) ? completionTokens : 0,
+    totalTokens: Number.isFinite(totalTokens) ? totalTokens : 0,
+  };
+}
+
+function addUsageTotals(
+  current: OpenAITokenUsage,
+  next: OpenAITokenUsage,
+): OpenAITokenUsage {
+  return {
+    promptTokens: current.promptTokens + next.promptTokens,
+    completionTokens: current.completionTokens + next.completionTokens,
+    totalTokens: current.totalTokens + next.totalTokens,
+  };
 }
 
 function writeIpcFile(dir: string, data: object): string {
@@ -865,6 +905,7 @@ async function runOpenAIQuery(
   let previousResponseId = sessionId;
   let input: string | OpenAIToolOutputInput[] = prompt;
   let response = await createResponse(input, previousResponseId, true);
+  let usageTotals = extractOpenAIUsage(response);
   previousResponseId = response.id;
 
   for (let turn = 0; turn < MAX_OPENAI_TOOL_TURNS; turn++) {
@@ -914,6 +955,7 @@ async function runOpenAIQuery(
 
     input = outputs;
     response = await createResponse(input, previousResponseId, false);
+    usageTotals = addUsageTotals(usageTotals, extractOpenAIUsage(response));
     previousResponseId = response.id;
   }
 
@@ -927,6 +969,8 @@ async function runOpenAIQuery(
     status: 'success',
     result: text || null,
     newSessionId: response.id,
+    usage: usageTotals,
+    model,
   });
 
   return {

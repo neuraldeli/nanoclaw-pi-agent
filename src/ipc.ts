@@ -11,6 +11,7 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { validateGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
@@ -357,9 +358,24 @@ export async function processTaskIpc(
         break;
       }
       if (data.jid && data.name && data.folder && data.trigger) {
+        let safeFolder: string;
+        try {
+          safeFolder = validateGroupFolder(data.folder);
+        } catch (err) {
+          logger.warn(
+            {
+              folder: data.folder,
+              sourceGroup,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            'Invalid register_group folder - blocked',
+          );
+          break;
+        }
+
         deps.registerGroup(data.jid, {
           name: data.name,
-          folder: data.folder,
+          folder: safeFolder,
           trigger: data.trigger,
           added_at: new Date().toISOString(),
           containerConfig: data.containerConfig,

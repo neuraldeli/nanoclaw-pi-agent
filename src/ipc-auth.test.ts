@@ -301,6 +301,24 @@ describe('register_group authorization', () => {
     // registeredGroups should not have changed
     expect(groups['new@g.us']).toBeUndefined();
   });
+
+  it('blocks invalid folder values for register_group', async () => {
+    await processTaskIpc(
+      {
+        type: 'register_group',
+        jid: 'escape@g.us',
+        name: 'Escape',
+        folder: '../../etc',
+        trigger: '@Andy',
+      },
+      'main',
+      true,
+      deps,
+    );
+
+    expect(groups['escape@g.us']).toBeUndefined();
+    expect(getRegisteredGroup('escape@g.us')).toBeUndefined();
+  });
 });
 
 // --- refresh_groups authorization ---

@@ -5,6 +5,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 // Mock config
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
+  MAIN_GROUP_FOLDER: 'main',
   TRIGGER_PATTERN: /^@Andy\b/i,
 }));
 
@@ -81,6 +82,20 @@ function createTestOpts(
         added_at: '2024-01-01T00:00:00.000Z',
       },
     })),
+    getUsageSummary: vi.fn(() => ({
+      all_time_runs: 2,
+      all_time_prompt_tokens: 100,
+      all_time_completion_tokens: 40,
+      all_time_total_tokens: 140,
+      last_24h_runs: 1,
+      last_24h_prompt_tokens: 60,
+      last_24h_completion_tokens: 20,
+      last_24h_total_tokens: 80,
+      last_model: 'gpt-5-codex',
+      last_used_at: '2026-02-21T10:00:00.000Z',
+    })),
+    getModel: vi.fn(() => 'gpt-5-codex'),
+    setModel: vi.fn((model: string) => model),
     ...overrides,
   };
 }
@@ -201,6 +216,8 @@ describe('TelegramChannel', () => {
 
       expect(currentBot().commandHandlers.has('chatid')).toBe(true);
       expect(currentBot().commandHandlers.has('ping')).toBe(true);
+      expect(currentBot().commandHandlers.has('usage')).toBe(true);
+      expect(currentBot().commandHandlers.has('model')).toBe(true);
       expect(currentBot().filterHandlers.has('message:text')).toBe(true);
       expect(currentBot().filterHandlers.has('message:photo')).toBe(true);
       expect(currentBot().filterHandlers.has('message:video')).toBe(true);
@@ -904,6 +921,121 @@ describe('TelegramChannel', () => {
       await handler(ctx);
 
       expect(ctx.reply).toHaveBeenCalledWith('Andy is online.');
+    });
+
+    it('/usage replies with usage summary for registered chats', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const handler = currentBot().commandHandlers.get('usage')!;
+      const ctx = {
+        chat: { id: 100200300 },
+        reply: vi.fn(),
+      };
+
+      await handler(ctx);
+
+      expect(opts.getUsageSummary).toHaveBeenCalledWith('tg:100200300');
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('Token usage for this chat'),
+      );
+    });
+
+    it('/usage handles chats with no usage yet', async () => {
+      const opts = createTestOpts({
+        getUsageSummary: vi.fn(() => ({
+          all_time_runs: 0,
+          all_time_prompt_tokens: 0,
+          all_time_completion_tokens: 0,
+          all_time_total_tokens: 0,
+          last_24h_runs: 0,
+          last_24h_prompt_tokens: 0,
+          last_24h_completion_tokens: 0,
+          last_24h_total_tokens: 0,
+          last_model: null,
+          last_used_at: null,
+        })),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const handler = currentBot().commandHandlers.get('usage')!;
+      const ctx = {
+        chat: { id: 100200300 },
+        reply: vi.fn(),
+      };
+
+      await handler(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'No token usage recorded yet for this chat.',
+      );
+    });
+
+    it('/model shows current model when no argument is passed', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const handler = currentBot().commandHandlers.get('model')!;
+      const ctx = {
+        chat: { id: 100200300 },
+        message: { text: '/model' },
+        reply: vi.fn(),
+      };
+
+      await handler(ctx);
+      expect(opts.getModel).toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('Current model: gpt-5-codex'),
+      );
+    });
+
+    it('/model updates model from main chat only', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'tg:100200300': {
+            name: 'Main',
+            folder: 'main',
+            trigger: '@Andy',
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+        })),
+      });
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const handler = currentBot().commandHandlers.get('model')!;
+      const ctx = {
+        chat: { id: 100200300 },
+        message: { text: '/model gpt-5-mini' },
+        reply: vi.fn(),
+      };
+
+      await handler(ctx);
+      expect(opts.setModel).toHaveBeenCalledWith('gpt-5-mini');
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('Model updated to gpt-5-mini'),
+      );
+    });
+
+    it('/model blocks updates from non-main chats', async () => {
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      const handler = currentBot().commandHandlers.get('model')!;
+      const ctx = {
+        chat: { id: 100200300 },
+        message: { text: '/model gpt-5-mini' },
+        reply: vi.fn(),
+      };
+
+      await handler(ctx);
+      expect(opts.setModel).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        'Only the main chat can change the model.',
+      );
     });
   });
 

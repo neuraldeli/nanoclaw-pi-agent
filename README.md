@@ -52,6 +52,14 @@ Use `tg:<id>` format, for example:
 - `tg:123456789` (private chat)
 - `tg:-1001234567890` (group/supergroup)
 
+## Telegram Commands
+
+- `/chatid`: show this chat's registration ID
+- `/ping`: health check
+- `/usage`: show token usage totals for this chat (all-time + last 24h)
+- `/model`: show active OpenAI model
+- `/model <name>`: switch model (main chat only, applies on next run)
+
 ## Main Scripts
 
 - `npm run setup`: interactive onboarding wizard

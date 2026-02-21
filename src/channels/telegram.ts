@@ -1,6 +1,6 @@
 import { Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, MAIN_GROUP_FOLDER, TRIGGER_PATTERN } from '../config.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -9,10 +9,45 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
+export interface UsageSummary {
+  all_time_runs: number;
+  all_time_prompt_tokens: number;
+  all_time_completion_tokens: number;
+  all_time_total_tokens: number;
+  last_24h_runs: number;
+  last_24h_prompt_tokens: number;
+  last_24h_completion_tokens: number;
+  last_24h_total_tokens: number;
+  last_model: string | null;
+  last_used_at: string | null;
+}
+
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  getUsageSummary?: (chatJid: string) => UsageSummary;
+  getModel?: () => string;
+  setModel?: (model: string) => string;
+}
+
+function formatUsageSummary(summary: UsageSummary): string {
+  const parts: string[] = [];
+  parts.push('Token usage for this chat');
+  parts.push(
+    `All time: ${summary.all_time_total_tokens.toLocaleString()} total (${summary.all_time_prompt_tokens.toLocaleString()} input, ${summary.all_time_completion_tokens.toLocaleString()} output) in ${summary.all_time_runs.toLocaleString()} run(s)`,
+  );
+  parts.push(
+    `Last 24h: ${summary.last_24h_total_tokens.toLocaleString()} total (${summary.last_24h_prompt_tokens.toLocaleString()} input, ${summary.last_24h_completion_tokens.toLocaleString()} output) in ${summary.last_24h_runs.toLocaleString()} run(s)`,
+  );
+  if (summary.last_model || summary.last_used_at) {
+    const lastRunAt = summary.last_used_at
+      ? new Date(summary.last_used_at).toLocaleString()
+      : 'unknown';
+    const lastModel = summary.last_model || 'unknown';
+    parts.push(`Last run: ${lastRunAt} (${lastModel})`);
+  }
+  return parts.join('\n');
 }
 
 export class TelegramChannel implements Channel {
@@ -48,6 +83,68 @@ export class TelegramChannel implements Channel {
     // Command to check bot status
     this.bot.command('ping', (ctx) => {
       ctx.reply(`${ASSISTANT_NAME} is online.`);
+    });
+
+    this.bot.command('usage', (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) {
+        ctx.reply('This chat is not registered yet.');
+        return;
+      }
+
+      if (!this.opts.getUsageSummary) {
+        ctx.reply('Usage tracking is not configured.');
+        return;
+      }
+
+      const summary = this.opts.getUsageSummary(chatJid);
+      if (summary.all_time_runs === 0) {
+        ctx.reply('No token usage recorded yet for this chat.');
+        return;
+      }
+
+      ctx.reply(formatUsageSummary(summary));
+    });
+
+    this.bot.command('model', (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) {
+        ctx.reply('This chat is not registered yet.');
+        return;
+      }
+
+      const text = ('message' in ctx && ctx.message?.text) ? ctx.message.text : '';
+      const parts = text.trim().split(/\s+/).filter(Boolean);
+
+      if (parts.length <= 1) {
+        if (!this.opts.getModel) {
+          ctx.reply('Model configuration is not available.');
+          return;
+        }
+        const current = this.opts.getModel();
+        ctx.reply(`Current model: ${current}\nUse /model <name> to switch.`);
+        return;
+      }
+
+      if (group.folder !== MAIN_GROUP_FOLDER) {
+        ctx.reply('Only the main chat can change the model.');
+        return;
+      }
+
+      if (!this.opts.setModel) {
+        ctx.reply('Model switching is not configured.');
+        return;
+      }
+
+      const requested = parts.slice(1).join(' ').trim();
+      try {
+        const applied = this.opts.setModel(requested);
+        ctx.reply(`Model updated to ${applied}. It will apply on the next run.`);
+      } catch (err) {
+        ctx.reply(err instanceof Error ? err.message : 'Invalid model value.');
+      }
     });
 
     this.bot.on('message:text', async (ctx) => {

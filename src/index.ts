@@ -1,10 +1,9 @@
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
-  DATA_DIR,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
@@ -26,7 +25,9 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getTokenUsageSummary,
   initDatabase,
+  logTokenUsage,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -34,6 +35,9 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { upsertEnvFile, readEnvFile } from './env.js';
+import { validateGroupFolder } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
@@ -51,6 +55,17 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const DEFAULT_OPENAI_MODEL = 'gpt-5-codex';
+
+function validateModelName(modelRaw: string): string {
+  const model = modelRaw.trim();
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,79}$/.test(model)) {
+    throw new Error(
+      'Invalid model name. Use letters, numbers, dot, underscore, colon, and hyphen (max 80 chars).',
+    );
+  }
+  return model;
+}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -78,15 +93,17 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
-  registeredGroups[jid] = group;
-  setRegisteredGroup(jid, group);
+  const safeFolder = validateGroupFolder(group.folder);
+  const normalizedGroup: RegisteredGroup = { ...group, folder: safeFolder };
+  registeredGroups[jid] = normalizedGroup;
+  setRegisteredGroup(jid, normalizedGroup);
 
   // Create group folder
-  const groupDir = path.join(DATA_DIR, '..', 'groups', group.folder);
+  const groupDir = path.join(GROUPS_DIR, safeFolder);
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
 
   logger.info(
-    { jid, name: group.name, folder: group.folder },
+    { jid, name: group.name, folder: safeFolder },
     'Group registered',
   );
 }
@@ -170,6 +187,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let outputSentToUser = false;
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
+    if (result.usage && result.usage.totalTokens > 0) {
+      logTokenUsage({
+        chat_jid: chatJid,
+        group_folder: group.folder,
+        model: result.model,
+        prompt_tokens: result.usage.promptTokens,
+        completion_tokens: result.usage.completionTokens,
+        total_tokens: result.usage.totalTokens,
+      });
+    }
+
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
@@ -393,65 +421,8 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
-  try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
-  } catch {
-    logger.info('Starting Apple Container system...');
-    try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
-      console.error(
-        '\n╔════════════════════════════════════════════════════════════════╗',
-      );
-      console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
-      );
-      console.error(
-        '║                                                                ║',
-      );
-      console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
-      );
-      console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
-      );
-      console.error(
-        '║  2. Run: container system start                               ║',
-      );
-      console.error(
-        '║  3. Restart NanoClaw                                          ║',
-      );
-      console.error(
-        '╚════════════════════════════════════════════════════════════════╝\n',
-      );
-      throw new Error('Apple Container system is required but failed to start');
-    }
-  }
-
-  // Kill and clean up orphaned NanoClaw containers from previous runs
-  try {
-    const output = execSync('container ls --format json', {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      encoding: 'utf-8',
-    });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
-    const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
-    for (const name of orphans) {
-      try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
-      } catch { /* already stopped */ }
-    }
-    if (orphans.length > 0) {
-      logger.info({ count: orphans.length, names: orphans }, 'Stopped orphaned containers');
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Failed to clean up orphaned containers');
-  }
+  ensureContainerRuntimeRunning();
+  cleanupOrphans();
 }
 
 async function main(): Promise<void> {
@@ -476,6 +447,15 @@ async function main(): Promise<void> {
     onChatMetadata: (chatJid: string, timestamp: string, name?: string, channel?: string, isGroup?: boolean) =>
       storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    getUsageSummary: (chatJid: string) => getTokenUsageSummary(chatJid),
+    getModel: () =>
+      readEnvFile(['OPENAI_MODEL']).OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+    setModel: (model: string) => {
+      const safeModel = validateModelName(model);
+      upsertEnvFile({ OPENAI_MODEL: safeModel });
+      logger.info({ model: safeModel }, 'OPENAI_MODEL updated via Telegram command');
+      return safeModel;
+    },
   };
 
   // Create and connect channels

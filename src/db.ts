@@ -58,6 +58,19 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
 
+    CREATE TABLE IF NOT EXISTS token_usage_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      model TEXT,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_token_usage_chat_time ON token_usage_logs(chat_jid, created_at);
+    CREATE INDEX IF NOT EXISTS idx_token_usage_group_time ON token_usage_logs(group_folder, created_at);
+
     CREATE TABLE IF NOT EXISTS router_state (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -458,6 +471,112 @@ export function logTaskRun(log: TaskRunLog): void {
     log.result,
     log.error,
   );
+}
+
+export interface TokenUsageLog {
+  chat_jid: string;
+  group_folder: string;
+  model?: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  created_at?: string;
+}
+
+export interface TokenUsageSummary {
+  all_time_runs: number;
+  all_time_prompt_tokens: number;
+  all_time_completion_tokens: number;
+  all_time_total_tokens: number;
+  last_24h_runs: number;
+  last_24h_prompt_tokens: number;
+  last_24h_completion_tokens: number;
+  last_24h_total_tokens: number;
+  last_model: string | null;
+  last_used_at: string | null;
+}
+
+export function logTokenUsage(log: TokenUsageLog): void {
+  db.prepare(
+    `
+    INSERT INTO token_usage_logs (chat_jid, group_folder, model, prompt_tokens, completion_tokens, total_tokens, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(
+    log.chat_jid,
+    log.group_folder,
+    log.model || null,
+    log.prompt_tokens,
+    log.completion_tokens,
+    log.total_tokens,
+    log.created_at || new Date().toISOString(),
+  );
+}
+
+export function getTokenUsageSummary(chatJid: string): TokenUsageSummary {
+  const allTime = db
+    .prepare(
+      `
+      SELECT
+        COUNT(*) AS runs,
+        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens
+      FROM token_usage_logs
+      WHERE chat_jid = ?
+    `,
+    )
+    .get(chatJid) as {
+    runs: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const last24h = db
+    .prepare(
+      `
+      SELECT
+        COUNT(*) AS runs,
+        COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+        COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+        COALESCE(SUM(total_tokens), 0) AS total_tokens
+      FROM token_usage_logs
+      WHERE chat_jid = ? AND created_at >= ?
+    `,
+    )
+    .get(chatJid, since24h) as {
+    runs: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+
+  const lastEntry = db
+    .prepare(
+      `
+      SELECT model, created_at
+      FROM token_usage_logs
+      WHERE chat_jid = ?
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    )
+    .get(chatJid) as { model: string | null; created_at: string } | undefined;
+
+  return {
+    all_time_runs: allTime.runs || 0,
+    all_time_prompt_tokens: allTime.prompt_tokens || 0,
+    all_time_completion_tokens: allTime.completion_tokens || 0,
+    all_time_total_tokens: allTime.total_tokens || 0,
+    last_24h_runs: last24h.runs || 0,
+    last_24h_prompt_tokens: last24h.prompt_tokens || 0,
+    last_24h_completion_tokens: last24h.completion_tokens || 0,
+    last_24h_total_tokens: last24h.total_tokens || 0,
+    last_model: lastEntry?.model || null,
+    last_used_at: lastEntry?.created_at || null,
+  };
 }
 
 // --- Router state accessors ---

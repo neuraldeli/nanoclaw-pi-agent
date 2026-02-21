@@ -7,7 +7,9 @@ import {
   getAllChats,
   getMessagesSince,
   getNewMessages,
+  getTokenUsageSummary,
   getTaskById,
+  logTokenUsage,
   storeChatMetadata,
   storeMessage,
   updateTask,
@@ -324,5 +326,54 @@ describe('task CRUD', () => {
 
     deleteTask('task-3');
     expect(getTaskById('task-3')).toBeUndefined();
+  });
+});
+
+describe('token usage logs', () => {
+  it('stores usage and returns per-chat summary', () => {
+    logTokenUsage({
+      chat_jid: 'tg:1',
+      group_folder: 'main',
+      model: 'gpt-5-codex',
+      prompt_tokens: 100,
+      completion_tokens: 40,
+      total_tokens: 140,
+      created_at: '2026-02-20T12:00:00.000Z',
+    });
+    logTokenUsage({
+      chat_jid: 'tg:1',
+      group_folder: 'main',
+      model: 'gpt-5-mini',
+      prompt_tokens: 80,
+      completion_tokens: 20,
+      total_tokens: 100,
+      created_at: '2026-02-21T12:00:00.000Z',
+    });
+    logTokenUsage({
+      chat_jid: 'tg:2',
+      group_folder: 'other',
+      model: 'gpt-5-codex',
+      prompt_tokens: 999,
+      completion_tokens: 1,
+      total_tokens: 1000,
+      created_at: '2026-02-21T12:00:00.000Z',
+    });
+
+    const summary = getTokenUsageSummary('tg:1');
+    expect(summary.all_time_runs).toBe(2);
+    expect(summary.all_time_prompt_tokens).toBe(180);
+    expect(summary.all_time_completion_tokens).toBe(60);
+    expect(summary.all_time_total_tokens).toBe(240);
+    expect(summary.last_model).toBe('gpt-5-mini');
+    expect(summary.last_used_at).toBe('2026-02-21T12:00:00.000Z');
+  });
+
+  it('returns zeroed summary when no data exists', () => {
+    const summary = getTokenUsageSummary('tg:none');
+    expect(summary.all_time_runs).toBe(0);
+    expect(summary.all_time_total_tokens).toBe(0);
+    expect(summary.last_24h_runs).toBe(0);
+    expect(summary.last_model).toBeNull();
+    expect(summary.last_used_at).toBeNull();
   });
 });
