@@ -10,6 +10,12 @@ import OpenAI from 'openai';
 import { fileURLToPath } from 'url';
 import { CronExpressionParser } from 'cron-parser';
 import { createHash } from 'crypto';
+import type {
+  ResponseCreateParamsNonStreaming,
+  ResponseCreateParamsStreaming,
+  ResponseIncludable,
+  ResponseInput,
+} from 'openai/resources/responses/responses';
 
 interface ContainerInput {
   prompt: string;
@@ -47,8 +53,10 @@ const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const DEFAULT_OPENAI_OAUTH_ORIGINATOR = 'codex_cli';
 const OPENAI_PARALLEL_TOOL_CALLS_ENV = 'OPENAI_PARALLEL_TOOL_CALLS';
 const OPENAI_OAUTH_ORIGINATOR_ENV = 'OPENAI_OAUTH_ORIGINATOR';
+const NANOCLAW_AGENT_VERSION = process.env.NANOCLAW_VERSION || process.env.npm_package_version || '1.0.0';
 
 interface OpenAIFunctionTool {
   type: 'function';
@@ -130,16 +138,6 @@ interface OpenAILocalShellCallOutputInput {
 
 type OpenAIToolOutputInput = OpenAIFunctionCallOutputInput | OpenAILocalShellCallOutputInput;
 
-interface OpenAIResponseStreamEventLike {
-  type?: string;
-  message?: string;
-  response?: OpenAIResponseLike & {
-    error?: {
-      message?: string;
-    } | null;
-  };
-}
-
 interface OpenAIOAuthTokenResponse {
   access_token?: string;
   refresh_token?: string;
@@ -198,6 +196,8 @@ function formatAgentError(err: unknown): string {
     const record = err as Error & {
       status?: number;
       request_id?: string;
+      cf_ray?: string;
+      body_preview?: string;
       error?: unknown;
       headers?: Record<string, unknown>;
     };
@@ -208,12 +208,155 @@ function formatAgentError(err: unknown): string {
     if (typeof record.request_id === 'string' && record.request_id) {
       details.push(`request_id=${record.request_id}`);
     }
+    if (typeof record.cf_ray === 'string' && record.cf_ray) {
+      details.push(`cf_ray=${record.cf_ray}`);
+    }
+    if (typeof record.body_preview === 'string' && record.body_preview) {
+      details.push(`body=${truncate(record.body_preview, 300)}`);
+    }
     if (isRecord(record.error) && typeof record.error.message === 'string') {
       details.push(`api_error=${truncate(record.error.message)}`);
     }
     return details.join(' | ');
   }
   return String(err);
+}
+
+function buildOAuthUserAgent(originator: string): string {
+  return `${originator}/${NANOCLAW_AGENT_VERSION} (${process.platform}; ${process.arch}) nanoclaw-agent-runner`;
+}
+
+function createHttpStatusError(
+  status: number,
+  message: string,
+  requestId?: string,
+  cfRay?: string,
+  bodyPreview?: string,
+): Error {
+  const err = new Error(message) as Error & {
+    status?: number;
+    request_id?: string;
+    cf_ray?: string;
+    body_preview?: string;
+  };
+  err.status = status;
+  if (requestId) {
+    err.request_id = requestId;
+  }
+  if (cfRay) {
+    err.cf_ray = cfRay;
+  }
+  if (bodyPreview) {
+    err.body_preview = bodyPreview;
+  }
+  return err;
+}
+
+async function parseOpenAIStreamingResponse(response: Response): Promise<OpenAIResponseLike> {
+  if (!response.body) {
+    throw new Error('OpenAI streaming response did not include a body');
+  }
+  const reader = response.body as unknown as AsyncIterable<Uint8Array>;
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let completedResponse: OpenAIResponseLike | undefined;
+
+  const handleBlock = (block: string): void => {
+    if (!block.trim()) return;
+    const dataLines = block
+      .split('\n')
+      .filter(line => line.startsWith('data:'))
+      .map(line => line.slice(5).trimStart());
+    if (dataLines.length === 0) return;
+    const rawData = dataLines.join('\n').trim();
+    if (!rawData || rawData === '[DONE]') return;
+
+    let eventPayload: unknown;
+    try {
+      eventPayload = JSON.parse(rawData);
+    } catch (err) {
+      throw new Error(`Failed to parse OpenAI SSE event: ${formatAgentError(err)}`);
+    }
+    if (!isRecord(eventPayload)) return;
+    const eventType = typeof eventPayload.type === 'string' ? eventPayload.type : '';
+    if (eventType === 'response.completed' && isRecord(eventPayload.response)) {
+      completedResponse = eventPayload.response as unknown as OpenAIResponseLike;
+      return;
+    }
+    if (eventType === 'response.failed') {
+      const eventResponse = isRecord(eventPayload.response) ? eventPayload.response : undefined;
+      const eventError = eventResponse && isRecord(eventResponse.error) ? eventResponse.error : undefined;
+      const message = eventError && typeof eventError.message === 'string'
+        ? eventError.message
+        : 'OpenAI streaming response failed';
+      throw new Error(message);
+    }
+    if (eventType === 'error') {
+      const message = typeof eventPayload.message === 'string'
+        ? eventPayload.message
+        : 'OpenAI streaming error';
+      throw new Error(message);
+    }
+  };
+
+  for await (const chunk of reader) {
+    buffer += decoder.decode(chunk, { stream: true });
+    buffer = buffer.replace(/\r\n/g, '\n');
+    let splitAt = buffer.indexOf('\n\n');
+    while (splitAt >= 0) {
+      const block = buffer.slice(0, splitAt);
+      buffer = buffer.slice(splitAt + 2);
+      handleBlock(block);
+      splitAt = buffer.indexOf('\n\n');
+    }
+  }
+  const tail = decoder.decode();
+  if (tail) {
+    buffer += tail;
+    buffer = buffer.replace(/\r\n/g, '\n');
+  }
+  if (buffer.trim()) {
+    handleBlock(buffer);
+  }
+  if (!completedResponse) {
+    throw new Error('OpenAI streaming response ended without response.completed');
+  }
+  return completedResponse;
+}
+
+async function createOpenAIOAuthStreamingResponse(
+  baseURL: string,
+  bearerToken: string,
+  headers: Record<string, string>,
+  body: ResponseCreateParamsStreaming,
+): Promise<OpenAIResponseLike> {
+  const requestUrl = `${baseURL.replace(/\/+$/, '')}/responses`;
+  const response = await fetch(requestUrl, {
+    method: 'POST',
+    headers: {
+      ...headers,
+      authorization: `Bearer ${bearerToken}`,
+      accept: 'text/event-stream',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const rawBody = await response.text();
+    const bodyPreview = truncate(rawBody || '(empty)', 700);
+    const requestId = response.headers.get('x-request-id') || response.headers.get('x-oai-request-id') || undefined;
+    const cfRay = response.headers.get('cf-ray') || undefined;
+    throw createHttpStatusError(
+      response.status,
+      `OpenAI OAuth responses request failed (${response.status})`,
+      requestId,
+      cfRay,
+      bodyPreview,
+    );
+  }
+
+  return await parseOpenAIStreamingResponse(response);
 }
 
 const OPENAI_FUNCTION_TOOLS: OpenAIFunctionTool[] = [
@@ -954,6 +1097,7 @@ async function runOpenAIQuery(
   const baseURL =
     sdkEnv.OPENAI_BASE_URL ||
     (hasApiKey ? undefined : CHATGPT_CODEX_BASE_URL);
+  const oauthBaseURL = (sdkEnv.OPENAI_BASE_URL || CHATGPT_CODEX_BASE_URL).replace(/\/+$/, '');
   const allowParallelToolCalls = sdkEnv[OPENAI_PARALLEL_TOOL_CALLS_ENV]?.toLowerCase() === 'true'
     ? true
     : hasApiKey;
@@ -964,25 +1108,23 @@ async function runOpenAIQuery(
   const chatgptAccountId = hasApiKey
     ? undefined
     : extractChatgptAccountIdFromJwt(apiKey);
-  const defaultHeaders: Record<string, string> = {};
-  if (chatgptAccountId) {
-    defaultHeaders['ChatGPT-Account-ID'] = chatgptAccountId;
-  }
-  if (!hasApiKey) {
-    defaultHeaders.session_id = toUuidLikeFromSeed(`nanoclaw:${containerInput.chatJid}`);
-    const configuredOriginator = sdkEnv[OPENAI_OAUTH_ORIGINATOR_ENV]?.trim();
-    if (configuredOriginator) {
-      defaultHeaders.originator = configuredOriginator;
-    }
-  }
+  const oauthOriginator = (sdkEnv[OPENAI_OAUTH_ORIGINATOR_ENV]?.trim() || DEFAULT_OPENAI_OAUTH_ORIGINATOR);
+  const oauthHeaders: Record<string, string> | undefined = hasApiKey
+    ? undefined
+    : {
+      session_id: toUuidLikeFromSeed(`nanoclaw:${containerInput.chatJid}`),
+      originator: oauthOriginator,
+      version: NANOCLAW_AGENT_VERSION,
+      'User-Agent': buildOAuthUserAgent(oauthOriginator),
+      ...(chatgptAccountId ? { 'ChatGPT-Account-ID': chatgptAccountId } : {}),
+    };
 
-  const client = new OpenAI({
-    apiKey,
-    baseURL,
-    defaultHeaders: Object.keys(defaultHeaders).length > 0
-      ? defaultHeaders
-      : undefined,
-  });
+  const client = hasApiKey
+    ? new OpenAI({
+      apiKey,
+      baseURL,
+    })
+    : undefined;
 
   const model = sdkEnv.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
   let activeModel = model;
@@ -993,61 +1135,95 @@ async function runOpenAIQuery(
     previousResponseId: string | undefined,
     allowResumeFallback: boolean,
   ): Promise<OpenAIResponseLike> => {
-    const createResponseRaw = async (body: Record<string, unknown>): Promise<OpenAIResponseLike> => {
-      return await client.responses.create(body as any) as OpenAIResponseLike;
+    const createResponseRaw = async (
+      body: ResponseCreateParamsNonStreaming,
+    ): Promise<OpenAIResponseLike> => {
+      if (!client) {
+        throw new Error('OpenAI API client unavailable for non-streaming request path');
+      }
+      return await client.responses.create(body) as OpenAIResponseLike;
     };
-    const createResponseStreamRaw = async (
-      body: Record<string, unknown>,
-    ): Promise<AsyncIterable<OpenAIResponseStreamEventLike>> => {
-      return await client.responses.create({
-        ...body,
-        stream: true,
-      } as any) as unknown as AsyncIterable<OpenAIResponseStreamEventLike>;
+    const createOAuthResponseRaw = async (
+      body: ResponseCreateParamsStreaming,
+    ): Promise<OpenAIResponseLike> => {
+      if (!oauthHeaders) {
+        throw new Error('OAuth headers unavailable for OpenAI OAuth request');
+      }
+      return await createOpenAIOAuthStreamingResponse(oauthBaseURL, apiKey, oauthHeaders, body);
     };
 
-    const requestInput = (!hasApiKey && typeof input === 'string')
+    const requestInput: string | ResponseInput = (!hasApiKey && typeof input === 'string')
       ? [{
         type: 'message',
         role: 'user',
         content: [{ type: 'input_text', text: input }],
       }]
-      : input;
-    const requestBodyBase = {
+      : (input as unknown as ResponseInput | string);
+    const include: ResponseIncludable[] = [];
+    const requestBodyBase: ResponseCreateParamsNonStreaming = {
       model: activeModel,
       input: requestInput,
-      previous_response_id: previousResponseId,
       instructions,
       tools,
       tool_choice: 'auto' as const,
       parallel_tool_calls: allowParallelToolCalls,
       store: false,
-      include: [] as string[],
+      include,
+      stream: false,
+    };
+    if (previousResponseId) {
+      requestBodyBase.previous_response_id = previousResponseId;
+    }
+    const runStreamingWithCompatibility = async (
+      baseBody: ResponseCreateParamsNonStreaming,
+      allowCompatibilityFallback: boolean,
+    ): Promise<OpenAIResponseLike> => {
+      const streamBody: ResponseCreateParamsStreaming = {
+        ...baseBody,
+        stream: true,
+      };
+      try {
+        return await createOAuthResponseRaw(streamBody);
+      } catch (streamErr) {
+        const streamStatus = errorStatusCode(streamErr);
+        if (!allowCompatibilityFallback || streamStatus !== 400) {
+          throw streamErr;
+        }
+        log('OAuth request rejected with tools (400). Retrying without tools.');
+        const noToolsBody: ResponseCreateParamsStreaming = {
+          model: baseBody.model,
+          input: requestInput,
+          stream: true,
+          store: false,
+        };
+        if (baseBody.instructions) {
+          noToolsBody.instructions = baseBody.instructions;
+        }
+        try {
+          return await createOAuthResponseRaw(noToolsBody);
+        } catch (noToolsErr) {
+          const noToolsStatus = errorStatusCode(noToolsErr);
+          if (noToolsStatus !== 400) {
+            throw noToolsErr;
+          }
+          log('OAuth request rejected without tools (400). Retrying minimal payload.');
+          const minimalBody: ResponseCreateParamsStreaming = {
+            model: baseBody.model,
+            input: requestInput,
+            stream: true,
+          };
+          return await createOAuthResponseRaw(minimalBody);
+        }
+      }
     };
     const createOnce = async (): Promise<OpenAIResponseLike> => {
       if (!useStreaming) {
         return await createResponseRaw(requestBodyBase);
       }
-
-      const stream = await createResponseStreamRaw(requestBodyBase);
-      let completedResponse: OpenAIResponseLike | undefined;
-      for await (const event of stream) {
-        if (!event || typeof event.type !== 'string') continue;
-        if (event.type === 'response.completed' && event.response) {
-          completedResponse = event.response;
-          continue;
-        }
-        if (event.type === 'response.failed') {
-          const message = event.response?.error?.message || 'OpenAI streaming response failed';
-          throw new Error(message);
-        }
-        if (event.type === 'error') {
-          throw new Error(event.message || 'OpenAI streaming error');
-        }
-      }
-      if (!completedResponse) {
-        throw new Error('OpenAI streaming response ended without response.completed');
-      }
-      return completedResponse;
+      return await runStreamingWithCompatibility(
+        requestBodyBase,
+        !previousResponseId && typeof input === 'string',
+      );
     };
 
     try {
@@ -1065,7 +1241,7 @@ async function runOpenAIQuery(
           `OpenAI request failed with model ${activeModel} (status 400). Retrying once with fallback model ${DEFAULT_OPENAI_MODEL}.`,
         );
         activeModel = DEFAULT_OPENAI_MODEL;
-        const fallbackBody = {
+        const fallbackBody: ResponseCreateParamsNonStreaming = {
           model: activeModel,
           input: requestInput,
           instructions,
@@ -1073,36 +1249,21 @@ async function runOpenAIQuery(
           tool_choice: 'auto' as const,
           parallel_tool_calls: false,
           store: false,
-          include: [] as string[],
+          include,
+          stream: false,
         };
         if (!useStreaming) {
           return await createResponseRaw(fallbackBody);
         }
-        const fallbackStream = await createResponseStreamRaw(fallbackBody);
-        let fallbackCompletedResponse: OpenAIResponseLike | undefined;
-        for await (const event of fallbackStream) {
-          if (!event || typeof event.type !== 'string') continue;
-          if (event.type === 'response.completed' && event.response) {
-            fallbackCompletedResponse = event.response;
-            continue;
-          }
-          if (event.type === 'response.failed') {
-            const message = event.response?.error?.message || 'OpenAI fallback streaming response failed';
-            throw new Error(message);
-          }
-          if (event.type === 'error') {
-            throw new Error(event.message || 'OpenAI fallback streaming error');
-          }
-        }
-        if (!fallbackCompletedResponse) {
-          throw new Error('OpenAI fallback streaming response ended without response.completed');
-        }
-        return fallbackCompletedResponse;
+        return await runStreamingWithCompatibility(
+          fallbackBody,
+          !previousResponseId && typeof input === 'string',
+        );
       }
       if (!allowResumeFallback || !previousResponseId) throw err;
       const msg = formatAgentError(err);
       log(`OpenAI resume failed for session ${previousResponseId}: ${msg}. Retrying without previous_response_id.`);
-      const resumedBody = {
+      const resumedBody: ResponseCreateParamsNonStreaming = {
         model: activeModel,
         input: requestInput,
         instructions,
@@ -1110,31 +1271,13 @@ async function runOpenAIQuery(
         tool_choice: 'auto' as const,
         parallel_tool_calls: allowParallelToolCalls,
         store: false,
-        include: [] as string[],
+        include,
+        stream: false,
       };
       if (!useStreaming) {
         return await createResponseRaw(resumedBody);
       }
-      const resumedStream = await createResponseStreamRaw(resumedBody);
-      let resumedCompletedResponse: OpenAIResponseLike | undefined;
-      for await (const event of resumedStream) {
-        if (!event || typeof event.type !== 'string') continue;
-        if (event.type === 'response.completed' && event.response) {
-          resumedCompletedResponse = event.response;
-          continue;
-        }
-        if (event.type === 'response.failed') {
-          const message = event.response?.error?.message || 'OpenAI resumed streaming response failed';
-          throw new Error(message);
-        }
-        if (event.type === 'error') {
-          throw new Error(event.message || 'OpenAI resumed streaming error');
-        }
-      }
-      if (!resumedCompletedResponse) {
-        throw new Error('OpenAI resumed streaming response ended without response.completed');
-      }
-      return resumedCompletedResponse;
+      return await runStreamingWithCompatibility(resumedBody, false);
     }
   };
 
