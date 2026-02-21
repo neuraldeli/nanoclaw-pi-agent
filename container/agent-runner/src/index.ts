@@ -42,6 +42,7 @@ const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const DEFAULT_OPENAI_MODEL = 'gpt-5-codex';
+const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -862,10 +863,14 @@ async function runOpenAIQuery(
   sdkEnv: Record<string, string | undefined>,
 ): Promise<{ newSessionId?: string }> {
   const apiKey = await resolveOpenAIApiKey(sdkEnv);
+  const hasApiKey = Boolean(sdkEnv.OPENAI_API_KEY && sdkEnv.OPENAI_API_KEY.trim());
+  const baseURL =
+    sdkEnv.OPENAI_BASE_URL ||
+    (hasApiKey ? undefined : CHATGPT_CODEX_BASE_URL);
 
   const client = new OpenAI({
     apiKey,
-    baseURL: sdkEnv.OPENAI_BASE_URL,
+    baseURL,
   });
 
   const model = sdkEnv.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
