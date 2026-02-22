@@ -340,6 +340,25 @@ export function getMessagesSince(
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
 }
 
+/**
+ * Get recent chat history (including bot messages) for context backfill.
+ */
+export function getRecentMessages(chatJid: string, limit: number): NewMessage[] {
+  const safeLimit = Math.max(1, Math.min(limit, 200));
+  const rows = db
+    .prepare(
+      `
+      SELECT id, chat_jid, sender, sender_name, content, timestamp
+      FROM messages
+      WHERE chat_jid = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `,
+    )
+    .all(chatJid, safeLimit) as NewMessage[];
+  return rows.reverse();
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {

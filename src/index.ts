@@ -23,6 +23,7 @@ import {
   getAllSessions,
   getAllTasks,
   getMessagesSince,
+  getRecentMessages,
   getNewMessages,
   getRouterState,
   getTokenUsageSummary,
@@ -56,6 +57,7 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 const DEFAULT_OPENAI_MODEL = 'gpt-5-codex';
+const CONTEXT_BACKFILL_LIMIT = 18;
 
 function validateModelName(modelRaw: string): string {
   const model = modelRaw.trim();
@@ -65,6 +67,29 @@ function validateModelName(modelRaw: string): string {
     );
   }
   return model;
+}
+
+function shouldBackfillConversationContext(): boolean {
+  const env = readEnvFile(['OPENAI_API_KEY']);
+  return !env.OPENAI_API_KEY;
+}
+
+function buildPromptMessages(chatJid: string, pendingMessages: NewMessage[]): NewMessage[] {
+  if (pendingMessages.length === 0) return pendingMessages;
+  if (!shouldBackfillConversationContext()) return pendingMessages;
+
+  const recent = getRecentMessages(chatJid, CONTEXT_BACKFILL_LIMIT);
+  if (recent.length === 0) return pendingMessages;
+
+  const merged = [...recent, ...pendingMessages];
+  const seen = new Set<string>();
+  const deduped: NewMessage[] = [];
+  for (const msg of merged) {
+    if (seen.has(msg.id)) continue;
+    seen.add(msg.id);
+    deduped.push(msg);
+  }
+  return deduped;
 }
 
 function loadState(): void {
@@ -157,7 +182,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  const promptMessages = buildPromptMessages(chatJid, missedMessages);
+  const prompt = formatMessages(promptMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -167,7 +193,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    {
+      group: group.name,
+      messageCount: missedMessages.length,
+      promptMessageCount: promptMessages.length,
+    },
     'Processing messages',
   );
 
@@ -377,11 +407,16 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
+          const promptMessages = buildPromptMessages(chatJid, messagesToSend);
+          const formatted = formatMessages(promptMessages);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              {
+                chatJid,
+                count: messagesToSend.length,
+                promptMessageCount: promptMessages.length,
+              },
               'Piped messages to active container',
             );
             lastAgentTimestamp[chatJid] =
