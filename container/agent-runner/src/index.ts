@@ -1077,12 +1077,24 @@ function isLikelyActionablePrompt(prompt: string): boolean {
   return /\b(build|create|deploy|publish|push|host|website|site|api|endpoint|http|https|curl|git|npm|docker|ssh|script|install|configure|run|fix)\b/i.test(prompt);
 }
 
+function isStrongExecutionIntent(prompt: string): boolean {
+  if (/\bexecute commands directly\b/i.test(prompt)) return true;
+  if (/\bask only when credentials are required\b/i.test(prompt)) return true;
+  if (/^\s*(create|build|deploy|publish|push|set up|setup|run|fix|install|configure)\b/i.test(prompt)) return true;
+  return false;
+}
+
 function containsCapabilityRefusal(text: string): boolean {
   return /can(?:'|’)?t access external (?:websites|sites)|cannot access external (?:websites|sites)|network access appears blocked|cannot directly operate|from this environment right now/i.test(text);
 }
 
 function shouldForceOAuthExecutionRetry(prompt: string, text: string): boolean {
   return isLikelyActionablePrompt(prompt) && containsCapabilityRefusal(text);
+}
+
+function looksLikeDeferredPlan(text: string): boolean {
+  return /\b(i(?:'|’)ll|i will)\s+(first|start|begin|try|attempt)\b/i.test(text)
+    || /\bi can still do this with you\b/i.test(text);
 }
 
 function buildForcedExecutionRetryPrompt(prompt: string): string {
@@ -1381,10 +1393,14 @@ async function runOpenAIQuery(
     response: OpenAIResponseLike;
     usageTotals: OpenAITokenUsage;
     previousResponseId: string | undefined;
+    toolCallsExecuted: number;
+    localShellCallsExecuted: number;
   }> => {
     let response = await createResponse(initialInput, initialPreviousResponseId, allowResumeFallback);
     let usageTotals = extractOpenAIUsage(response);
     let previousResponseId = supportsPreviousResponseId ? response.id : undefined;
+    let toolCallsExecuted = 0;
+    let localShellCallsExecuted = 0;
 
     for (let turn = 0; turn < MAX_OPENAI_TOOL_TURNS; turn++) {
       const calls = extractOpenAIToolCalls(response);
@@ -1399,6 +1415,7 @@ async function runOpenAIQuery(
           try {
             const parsedArgs = parseOpenAIFunctionArgs(call.arguments);
             const outputText = executeOpenAITool(call.name, parsedArgs, containerInput);
+            toolCallsExecuted += 1;
             outputs.push({
               type: 'function_call_output',
               call_id: call.call_id,
@@ -1419,6 +1436,8 @@ async function runOpenAIQuery(
 
         try {
           const localShellOutput = await executeLocalShellToolCall(item.call, sdkEnv);
+          toolCallsExecuted += 1;
+          localShellCallsExecuted += 1;
           outputs.push(localShellOutput);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -1441,7 +1460,7 @@ async function runOpenAIQuery(
       throw new Error(`OpenAI tool loop exceeded ${MAX_OPENAI_TOOL_TURNS} turns`);
     }
 
-    return { response, usageTotals, previousResponseId };
+    return { response, usageTotals, previousResponseId, toolCallsExecuted, localShellCallsExecuted };
   };
 
   log(`Running OpenAI query with model ${activeModel} (session: ${supportsPreviousResponseId ? (sessionId || 'new') : 'new'})`);
@@ -1458,8 +1477,17 @@ async function runOpenAIQuery(
   let usageTotals = turnResult.usageTotals;
   let text = extractOpenAIText(response);
 
-  if (!hasApiKey && shouldForceOAuthExecutionRetry(prompt, text)) {
-    log('Detected non-executing capability refusal in OAuth mode. Retrying with forced execution backstop.');
+  const needsExecutionBackstop = !hasApiKey && (
+    shouldForceOAuthExecutionRetry(prompt, text)
+    || (
+      isStrongExecutionIntent(prompt)
+      && turnResult.toolCallsExecuted === 0
+      && looksLikeDeferredPlan(text)
+    )
+  );
+
+  if (needsExecutionBackstop) {
+    log('Detected non-executing response in OAuth mode. Retrying with forced execution backstop.');
     const retryPrompt = buildForcedExecutionRetryPrompt(prompt);
     const retryResult = await runTurn(retryPrompt, undefined, false);
     response = retryResult.response;
