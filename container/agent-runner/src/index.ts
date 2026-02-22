@@ -60,6 +60,8 @@ const DEFAULT_OPENAI_OAUTH_INSTRUCTIONS = [
   'You can access the public internet and external APIs through shell commands (for example curl, git, npm, apt) when network is available.',
   'When users ask to interact with a website or endpoint, attempt it directly via shell tools first instead of saying you cannot access websites.',
   'Only report inability to access a website after an actual command attempt fails, and include the concrete failure.',
+  'Never claim external access is blocked unless you have first run a command that proves it.',
+  'For deployment/build tasks, start by creating/changing files and running commands immediately; ask for auth only at the exact blocking step.',
   'If blocked by missing auth/secrets, ask only for the minimum required information and continue execution.',
 ].join(' ');
 const DEFAULT_OPENAI_OAUTH_ORIGINATOR = 'codex_cli';
@@ -1054,6 +1056,23 @@ function requireOAuthInstructions(instructions: string | null | undefined): stri
   return DEFAULT_OPENAI_OAUTH_INSTRUCTIONS;
 }
 
+function extractFirstHttpUrl(text: string): string | undefined {
+  const match = text.match(/\bhttps?:\/\/[^\s<>"')]+/i);
+  return match?.[0];
+}
+
+function augmentOAuthPromptForExecution(prompt: string): string {
+  const url = extractFirstHttpUrl(prompt);
+  if (!url) return prompt;
+  return [
+    prompt,
+    '',
+    '[Execution requirement]',
+    `Because this request includes URL ${url}, run at least one local_shell command against it first (for example: curl -I --max-time 12 ${url}).`,
+    'Do not claim website/network inaccessibility unless that command fails and you report the concrete error output.',
+  ].join('\n');
+}
+
 function parseOptionalEpochMs(raw: string | undefined): number | undefined {
   if (!raw) return undefined;
   const value = Number.parseInt(raw, 10);
@@ -1329,7 +1348,9 @@ async function runOpenAIQuery(
 
   log(`Running OpenAI query with model ${activeModel} (session: ${supportsPreviousResponseId ? (sessionId || 'new') : 'new'})`);
   let previousResponseId = supportsPreviousResponseId ? sessionId : undefined;
-  let input: string | OpenAIToolOutputInput[] = prompt;
+  let input: string | OpenAIToolOutputInput[] = hasApiKey
+    ? prompt
+    : augmentOAuthPromptForExecution(prompt);
   let response = await createResponse(input, previousResponseId, supportsPreviousResponseId);
   let usageTotals = extractOpenAIUsage(response);
   previousResponseId = supportsPreviousResponseId ? response.id : undefined;
