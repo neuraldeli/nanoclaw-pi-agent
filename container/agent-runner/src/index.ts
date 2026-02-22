@@ -1073,6 +1073,33 @@ function augmentOAuthPromptForExecution(prompt: string): string {
   ].join('\n');
 }
 
+function isLikelyActionablePrompt(prompt: string): boolean {
+  return /\b(build|create|deploy|publish|push|host|website|site|api|endpoint|http|https|curl|git|npm|docker|ssh|script|install|configure|run|fix)\b/i.test(prompt);
+}
+
+function containsCapabilityRefusal(text: string): boolean {
+  return /can(?:'|’)?t access external (?:websites|sites)|cannot access external (?:websites|sites)|network access appears blocked|cannot directly operate|from this environment right now/i.test(text);
+}
+
+function shouldForceOAuthExecutionRetry(prompt: string, text: string): boolean {
+  return isLikelyActionablePrompt(prompt) && containsCapabilityRefusal(text);
+}
+
+function buildForcedExecutionRetryPrompt(prompt: string): string {
+  const url = extractFirstHttpUrl(prompt);
+  const recommendedCommand = url
+    ? `curl -I --max-time 12 ${url}`
+    : 'bash -lc "pwd && ls -la"';
+  return [
+    augmentOAuthPromptForExecution(prompt),
+    '',
+    '[Hard execution requirement]',
+    'Your prior answer was invalid because it claimed inability without proving it.',
+    `Invoke local_shell at least once before giving a final answer. Recommended first command: ${recommendedCommand}`,
+    'If a command fails, report exact stderr and continue with the next best command.',
+  ].join('\n');
+}
+
 function parseOptionalEpochMs(raw: string | undefined): number | undefined {
   if (!raw) return undefined;
   const value = Number.parseInt(raw, 10);
@@ -1346,72 +1373,100 @@ async function runOpenAIQuery(
     }
   };
 
-  log(`Running OpenAI query with model ${activeModel} (session: ${supportsPreviousResponseId ? (sessionId || 'new') : 'new'})`);
-  let previousResponseId = supportsPreviousResponseId ? sessionId : undefined;
-  let input: string | OpenAIToolOutputInput[] = hasApiKey
-    ? prompt
-    : augmentOAuthPromptForExecution(prompt);
-  let response = await createResponse(input, previousResponseId, supportsPreviousResponseId);
-  let usageTotals = extractOpenAIUsage(response);
-  previousResponseId = supportsPreviousResponseId ? response.id : undefined;
+  const runTurn = async (
+    initialInput: string | OpenAIToolOutputInput[],
+    initialPreviousResponseId: string | undefined,
+    allowResumeFallback: boolean,
+  ): Promise<{
+    response: OpenAIResponseLike;
+    usageTotals: OpenAITokenUsage;
+    previousResponseId: string | undefined;
+  }> => {
+    let response = await createResponse(initialInput, initialPreviousResponseId, allowResumeFallback);
+    let usageTotals = extractOpenAIUsage(response);
+    let previousResponseId = supportsPreviousResponseId ? response.id : undefined;
 
-  for (let turn = 0; turn < MAX_OPENAI_TOOL_TURNS; turn++) {
-    const calls = extractOpenAIToolCalls(response);
-    if (calls.length === 0) break;
+    for (let turn = 0; turn < MAX_OPENAI_TOOL_TURNS; turn++) {
+      const calls = extractOpenAIToolCalls(response);
+      if (calls.length === 0) break;
 
-    log(`OpenAI requested ${calls.length} tool call(s) on turn ${turn + 1}`);
-    const outputs: OpenAIToolOutputInput[] = [];
+      log(`OpenAI requested ${calls.length} tool call(s) on turn ${turn + 1}`);
+      const outputs: OpenAIToolOutputInput[] = [];
 
-    for (const item of calls) {
-      if (item.kind === 'function') {
-        const call = item.call;
+      for (const item of calls) {
+        if (item.kind === 'function') {
+          const call = item.call;
+          try {
+            const parsedArgs = parseOpenAIFunctionArgs(call.arguments);
+            const outputText = executeOpenAITool(call.name, parsedArgs, containerInput);
+            outputs.push({
+              type: 'function_call_output',
+              call_id: call.call_id,
+              output: outputText,
+            });
+            log(`Function tool succeeded: ${call.name}`);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            outputs.push({
+              type: 'function_call_output',
+              call_id: call.call_id,
+              output: `Tool error: ${message}`,
+            });
+            log(`Function tool failed: ${call.name} (${message})`);
+          }
+          continue;
+        }
+
         try {
-          const parsedArgs = parseOpenAIFunctionArgs(call.arguments);
-          const outputText = executeOpenAITool(call.name, parsedArgs, containerInput);
-          outputs.push({
-            type: 'function_call_output',
-            call_id: call.call_id,
-            output: outputText,
-          });
-          log(`Function tool succeeded: ${call.name}`);
+          const localShellOutput = await executeLocalShellToolCall(item.call, sdkEnv);
+          outputs.push(localShellOutput);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           outputs.push({
-            type: 'function_call_output',
-            call_id: call.call_id,
-            output: `Tool error: ${message}`,
+            type: 'local_shell_call_output',
+            id: item.call.id,
+            output: JSON.stringify({ error: message }),
           });
-          log(`Function tool failed: ${call.name} (${message})`);
+          log(`Local shell tool failed: ${message}`);
         }
-        continue;
       }
 
-      try {
-        const localShellOutput = await executeLocalShellToolCall(item.call, sdkEnv);
-        outputs.push(localShellOutput);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        outputs.push({
-          type: 'local_shell_call_output',
-          id: item.call.id,
-          output: JSON.stringify({ error: message }),
-        });
-        log(`Local shell tool failed: ${message}`);
-      }
+      response = await createResponse(outputs, previousResponseId, supportsPreviousResponseId);
+      usageTotals = addUsageTotals(usageTotals, extractOpenAIUsage(response));
+      previousResponseId = supportsPreviousResponseId ? response.id : undefined;
     }
 
-    input = outputs;
-    response = await createResponse(input, previousResponseId, supportsPreviousResponseId);
-    usageTotals = addUsageTotals(usageTotals, extractOpenAIUsage(response));
-    previousResponseId = supportsPreviousResponseId ? response.id : undefined;
+    const remainingCalls = extractOpenAIToolCalls(response);
+    if (remainingCalls.length > 0) {
+      throw new Error(`OpenAI tool loop exceeded ${MAX_OPENAI_TOOL_TURNS} turns`);
+    }
+
+    return { response, usageTotals, previousResponseId };
+  };
+
+  log(`Running OpenAI query with model ${activeModel} (session: ${supportsPreviousResponseId ? (sessionId || 'new') : 'new'})`);
+  const firstInput: string | OpenAIToolOutputInput[] = hasApiKey
+    ? prompt
+    : augmentOAuthPromptForExecution(prompt);
+  let turnResult = await runTurn(
+    firstInput,
+    supportsPreviousResponseId ? sessionId : undefined,
+    supportsPreviousResponseId,
+  );
+
+  let response = turnResult.response;
+  let usageTotals = turnResult.usageTotals;
+  let text = extractOpenAIText(response);
+
+  if (!hasApiKey && shouldForceOAuthExecutionRetry(prompt, text)) {
+    log('Detected non-executing capability refusal in OAuth mode. Retrying with forced execution backstop.');
+    const retryPrompt = buildForcedExecutionRetryPrompt(prompt);
+    const retryResult = await runTurn(retryPrompt, undefined, false);
+    response = retryResult.response;
+    usageTotals = addUsageTotals(usageTotals, retryResult.usageTotals);
+    text = extractOpenAIText(response);
   }
 
-  const remainingCalls = extractOpenAIToolCalls(response);
-  if (remainingCalls.length > 0) {
-    throw new Error(`OpenAI tool loop exceeded ${MAX_OPENAI_TOOL_TURNS} turns`);
-  }
-
-  const text = extractOpenAIText(response);
   writeOutput({
     status: 'success',
     result: text || null,
