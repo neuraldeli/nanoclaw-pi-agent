@@ -53,10 +53,17 @@ const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
-const DEFAULT_OPENAI_OAUTH_INSTRUCTIONS = 'You are NanoClaw, a coding assistant that helps users complete software tasks and operations safely and accurately.';
+const DEFAULT_OPENAI_OAUTH_INSTRUCTIONS = [
+  'You are NanoClaw, a coding assistant running inside a containerized execution environment.',
+  'When users ask you to build, change, or deploy something, act directly by using available tools.',
+  'Prefer execution over instructions. Do not just list steps unless a required credential/permission is missing.',
+  'If blocked by missing auth/secrets, ask only for the minimum required information and continue execution.',
+].join(' ');
 const DEFAULT_OPENAI_OAUTH_ORIGINATOR = 'codex_cli';
 const OPENAI_PARALLEL_TOOL_CALLS_ENV = 'OPENAI_PARALLEL_TOOL_CALLS';
 const OPENAI_OAUTH_ORIGINATOR_ENV = 'OPENAI_OAUTH_ORIGINATOR';
+const OPENAI_OAUTH_ENABLE_FUNCTION_TOOLS_ENV = 'OPENAI_OAUTH_ENABLE_FUNCTION_TOOLS';
+const OPENAI_OAUTH_ENABLE_WEB_SEARCH_ENV = 'OPENAI_OAUTH_ENABLE_WEB_SEARCH';
 const NANOCLAW_AGENT_VERSION = process.env.NANOCLAW_VERSION || process.env.npm_package_version || '1.0.0';
 
 interface OpenAIFunctionTool {
@@ -481,6 +488,31 @@ const OPENAI_TOOLS: OpenAITool[] = [
 const OPENAI_OAUTH_TOOLS: OpenAITool[] = [
   { type: 'local_shell' },
 ];
+
+function isEnvFalse(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off';
+}
+
+function isEnvTrue(value: string | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
+}
+
+function buildOpenAIOAuthTools(sdkEnv: Record<string, string | undefined>): OpenAITool[] {
+  const tools: OpenAITool[] = [...OPENAI_OAUTH_TOOLS];
+  const includeFunctionTools = !isEnvFalse(sdkEnv[OPENAI_OAUTH_ENABLE_FUNCTION_TOOLS_ENV]);
+  if (includeFunctionTools) {
+    tools.push(...OPENAI_FUNCTION_TOOLS);
+  }
+  const includeWebSearch = isEnvTrue(sdkEnv[OPENAI_OAUTH_ENABLE_WEB_SEARCH_ENV]);
+  if (includeWebSearch) {
+    tools.push({ type: 'web_search_preview' });
+  }
+  return tools;
+}
 
 async function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -1111,7 +1143,7 @@ async function runOpenAIQuery(
     : hasApiKey;
   const tools: OpenAITool[] = hasApiKey
     ? OPENAI_TOOLS
-    : OPENAI_OAUTH_TOOLS;
+    : buildOpenAIOAuthTools(sdkEnv);
   const useStreaming = !hasApiKey;
   const chatgptAccountId = hasApiKey
     ? undefined
