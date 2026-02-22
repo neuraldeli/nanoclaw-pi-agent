@@ -1101,6 +1101,7 @@ async function runOpenAIQuery(
 ): Promise<{ newSessionId?: string }> {
   const apiKey = await resolveOpenAIApiKey(sdkEnv);
   const hasApiKey = Boolean(sdkEnv.OPENAI_API_KEY && sdkEnv.OPENAI_API_KEY.trim());
+  const supportsPreviousResponseId = hasApiKey;
   const baseURL =
     sdkEnv.OPENAI_BASE_URL ||
     (hasApiKey ? undefined : CHATGPT_CODEX_BASE_URL);
@@ -1181,7 +1182,7 @@ async function runOpenAIQuery(
       include,
       stream: false,
     };
-    if (previousResponseId) {
+    if (supportsPreviousResponseId && previousResponseId) {
       requestBodyBase.previous_response_id = previousResponseId;
     }
     const runStreamingWithCompatibility = async (
@@ -1291,12 +1292,12 @@ async function runOpenAIQuery(
     }
   };
 
-  log(`Running OpenAI query with model ${activeModel} (session: ${sessionId || 'new'})`);
-  let previousResponseId = sessionId;
+  log(`Running OpenAI query with model ${activeModel} (session: ${supportsPreviousResponseId ? (sessionId || 'new') : 'new'})`);
+  let previousResponseId = supportsPreviousResponseId ? sessionId : undefined;
   let input: string | OpenAIToolOutputInput[] = prompt;
-  let response = await createResponse(input, previousResponseId, true);
+  let response = await createResponse(input, previousResponseId, supportsPreviousResponseId);
   let usageTotals = extractOpenAIUsage(response);
-  previousResponseId = response.id;
+  previousResponseId = supportsPreviousResponseId ? response.id : undefined;
 
   for (let turn = 0; turn < MAX_OPENAI_TOOL_TURNS; turn++) {
     const calls = extractOpenAIToolCalls(response);
@@ -1344,9 +1345,9 @@ async function runOpenAIQuery(
     }
 
     input = outputs;
-    response = await createResponse(input, previousResponseId, false);
+    response = await createResponse(input, previousResponseId, supportsPreviousResponseId);
     usageTotals = addUsageTotals(usageTotals, extractOpenAIUsage(response));
-    previousResponseId = response.id;
+    previousResponseId = supportsPreviousResponseId ? response.id : undefined;
   }
 
   const remainingCalls = extractOpenAIToolCalls(response);
@@ -1358,13 +1359,13 @@ async function runOpenAIQuery(
   writeOutput({
     status: 'success',
     result: text || null,
-    newSessionId: response.id,
+    newSessionId: supportsPreviousResponseId ? response.id : undefined,
     usage: usageTotals,
     model: activeModel,
   });
 
   return {
-    newSessionId: response.id,
+    newSessionId: supportsPreviousResponseId ? response.id : undefined,
   };
 }
 
