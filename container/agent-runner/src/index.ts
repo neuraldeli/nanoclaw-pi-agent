@@ -53,6 +53,7 @@ const CHATGPT_CODEX_BASE_URL = 'https://chatgpt.com/backend-api/codex';
 const MAX_OPENAI_TOOL_TURNS = 24;
 const OPENAI_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
 const DEFAULT_OPENAI_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const DEFAULT_OPENAI_OAUTH_INSTRUCTIONS = 'You are NanoClaw, a coding assistant that helps users complete software tasks and operations safely and accurately.';
 const DEFAULT_OPENAI_OAUTH_ORIGINATOR = 'codex_cli';
 const OPENAI_PARALLEL_TOOL_CALLS_ENV = 'OPENAI_PARALLEL_TOOL_CALLS';
 const OPENAI_OAUTH_ORIGINATOR_ENV = 'OPENAI_OAUTH_ORIGINATOR';
@@ -1012,6 +1013,12 @@ function buildOpenAIInstructions(containerInput: ContainerInput): string | undef
   return fs.readFileSync(globalCodexMdPath, 'utf-8');
 }
 
+function requireOAuthInstructions(instructions: string | null | undefined): string {
+  const trimmed = instructions?.trim();
+  if (trimmed) return trimmed;
+  return DEFAULT_OPENAI_OAUTH_INSTRUCTIONS;
+}
+
 function parseOptionalEpochMs(raw: string | undefined): number | undefined {
   if (!raw) return undefined;
   const value = Number.parseInt(raw, 10);
@@ -1128,7 +1135,10 @@ async function runOpenAIQuery(
 
   const model = sdkEnv.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
   let activeModel = model;
-  const instructions = buildOpenAIInstructions(containerInput);
+  const baseInstructions = buildOpenAIInstructions(containerInput);
+  const instructions = hasApiKey
+    ? baseInstructions
+    : requireOAuthInstructions(baseInstructions);
 
   const createResponse = async (
     input: string | OpenAIToolOutputInput[],
@@ -1178,6 +1188,7 @@ async function runOpenAIQuery(
       baseBody: ResponseCreateParamsNonStreaming,
       allowCompatibilityFallback: boolean,
     ): Promise<OpenAIResponseLike> => {
+      const requiredInstructions = requireOAuthInstructions(baseBody.instructions);
       const streamBody: ResponseCreateParamsStreaming = {
         ...baseBody,
         stream: true,
@@ -1193,12 +1204,10 @@ async function runOpenAIQuery(
         const noToolsBody: ResponseCreateParamsStreaming = {
           model: baseBody.model,
           input: requestInput,
+          instructions: requiredInstructions,
           stream: true,
           store: false,
         };
-        if (baseBody.instructions) {
-          noToolsBody.instructions = baseBody.instructions;
-        }
         try {
           return await createOAuthResponseRaw(noToolsBody);
         } catch (noToolsErr) {
@@ -1210,6 +1219,7 @@ async function runOpenAIQuery(
           const minimalBody: ResponseCreateParamsStreaming = {
             model: baseBody.model,
             input: requestInput,
+            instructions: requiredInstructions,
             stream: true,
           };
           return await createOAuthResponseRaw(minimalBody);
